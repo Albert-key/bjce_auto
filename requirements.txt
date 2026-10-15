@@ -1,0 +1,5 @@
+# 自动播放脚本运行依赖 (Python 3.10+)
+# 若不想使用 pip, 也可运行 python install_libs.py 直接下载解压依赖
+playwright>=1.40
+greenlet>=3.0
+pyee>=12.0
