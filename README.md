@@ -41,8 +41,6 @@
 ### 方式二：源码运行
 
 ```bash
-git clone https://github.com/<你的用户名>/bjce-auto-player.git
-cd bjce-auto-player
 
 # 安装依赖（需要 Python 3.10+）
 pip install -r requirements.txt
