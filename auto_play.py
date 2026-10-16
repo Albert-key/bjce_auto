@@ -94,8 +94,9 @@ IDLE_GUARD_JS = """
 STATE_JS = """
 () => {
   const v = document.querySelector('video');
+  // 只取章节/集菜单 ul —— 排除"相关课程"列表(点击会跳去其他课程)
   const lis = Array.from(document.querySelectorAll(
-      '.iv-course-play-detail-menu-item li'));
+      '.iv-course-play-detail-menu-item:not(.iv-course-play-detail-menu-cour) li'));
   let activeIdx = -1;
   lis.forEach((li, i) => {
     if ((li.className || '').indexOf('iv-c-p-active') >= 0) activeIdx = i;
@@ -299,7 +300,7 @@ class Site:
   title: document.title,
   hasVideo: !!document.querySelector('video'),
   chapters: document.querySelectorAll(
-      '.iv-course-play-detail-menu-item li').length,
+      '.iv-course-play-detail-menu-item:not(.iv-course-play-detail-menu-cour) li').length,
   modals: Array.from(document.querySelectorAll('.ivu-modal'))
       .filter(m => m.offsetParent !== null)
       .map(m => (m.textContent || '').replace(/\\s+/g, ' ').slice(0, 80)),
@@ -638,7 +639,8 @@ class Site:
             lis = []
             while time.time() < deadline:
                 lis = self.page.query_selector_all(
-                    ".iv-course-play-detail-menu-item li")
+                    ".iv-course-play-detail-menu-item"
+                    ":not(.iv-course-play-detail-menu-cour) li")
                 if 0 <= idx < len(lis):
                     try:
                         if lis[idx].is_visible():
@@ -680,9 +682,15 @@ class Site:
             LOG.write("  ⚠ 未嗅探到 playinfo, 但视频元素存在, 尝试直接播放")
 
         if ctype is not None and str(ctype) != "4":
-            LOG.write(f"  ✗ 课件类型 coursewareType={ctype}, 非视频课件"
-                      "(AICC/文档), 暂不支持自动播放, 跳过")
-            return False
+            # 非视频课件(AICC/文档): 单章节课程直接跳过;
+            # 多章节/多集课程继续尝试(监控循环会自动切换到有视频的章节)
+            st0 = self.read_state()
+            if st0.get("chapters", 0) <= 1:
+                LOG.write(f"  ✗ 课件类型 coursewareType={ctype}, 非视频课件"
+                          "(AICC/文档), 暂不支持自动播放, 跳过")
+                return False
+            LOG.write(f"  ⚠ 首课件类型 coursewareType={ctype} 非视频, "
+                      f"共 {st0['chapters']} 章/集, 尝试切换后续章节")
 
         try:
             self.page.wait_for_selector("video", timeout=30000)
@@ -742,12 +750,24 @@ class Site:
                     pass
 
             if not st.get("hasVideo"):
-                # 无视频元素: 可能页面异常/登录失效, 3 分钟后放弃本课
+                # 无视频元素: 课程包中可能混有文档/AICC 类型的集
                 if no_video_since is None:
                     no_video_since = time.time()
-                elif time.time() - no_video_since > 180:
-                    LOG.write("  ✗ 长时间无视频元素(可能未登录或页面异常), 跳过本课")
-                    return False
+                elif time.time() - no_video_since > 30:
+                    nxt = st["activeIdx"] + 1
+                    if (st["activeIdx"] >= 0 and st["chapters"]
+                            and nxt < st["chapters"]):
+                        LOG.write(f"  ⚠ 无视频元素(30秒), "
+                                  f"切换第 {nxt + 1} 章/集")
+                        self.click_chapter(nxt)
+                        self.page.wait_for_timeout(6000)
+                        self.sniffed.pop("playinfo", None)
+                        no_video_since = None
+                        continue
+                    if time.time() - no_video_since > 180:
+                        LOG.write("  ✗ 长时间无视频元素(可能未登录或页面异常), "
+                                  "跳过本课")
+                        return False
                 self.page.wait_for_timeout(SCAN_INTERVAL * 1000)
                 continue
             no_video_since = None
@@ -857,6 +877,7 @@ class Site:
         deadline = time.time() + 3 * 3600
         last_chapter = -2
         last_check = time.time()
+        no_video_since = None
         while time.time() < deadline:
             # 每 60 秒检查一次完成条件
             if time.time() - last_check >= 60:
@@ -882,6 +903,22 @@ class Site:
                     self.page.evaluate(CLOSE_ALERT_JS)
                 except Exception:
                     pass
+            if not st.get("hasVideo"):
+                # 无视频(文档/AICC 集 或切换暂态): 30 秒后切换下一章/集
+                if no_video_since is None:
+                    no_video_since = time.time()
+                elif time.time() - no_video_since > 30:
+                    nxt = st["activeIdx"] + 1
+                    if (st["activeIdx"] >= 0 and st["chapters"]
+                            and nxt < st["chapters"]):
+                        LOG.write(f"  ⚠ 补播遇无视频章节, 切换第 {nxt + 1} 章/集")
+                        self.click_chapter(nxt)
+                        self.page.wait_for_timeout(6000)
+                        self.sniffed.pop("playinfo", None)
+                        no_video_since = None
+                self.page.wait_for_timeout(SCAN_INTERVAL * 1000)
+                continue
+            no_video_since = None
             if st.get("ended"):
                 nxt = st["activeIdx"] + 1
                 if st["chapters"] and nxt < st["chapters"]:
@@ -955,7 +992,7 @@ def build_queue(site: Site, need_must: bool, need_select: bool):
         add(lib, elec_q)
         LOG.write(f"选课中心补充选修: 现有 {len(elec_q)} 门候选")
 
-    # 过滤不适合自动播放的课程(考试课/课程包/外链课)
+    # 过滤不适合自动播放的课程(考试课/外链课)
     def playable(queue):
         out = []
         for r in queue:
@@ -966,12 +1003,10 @@ def build_queue(site: Site, need_must: bool, need_select: bool):
             if detail.get("isContainExam") == 1:
                 LOG.write(f"    跳过含考试课程: {r['name']}")
                 continue
-            if str(detail.get("setType")) == "3":
-                LOG.write(f"    跳过课程包: {r['name']}")
-                continue
             if detail.get("courseResourceUrl"):
                 LOG.write(f"    跳过外链课程: {r['name']}")
                 continue
+            # setType=3 课程包(多集课程)不再跳过: 已实测可通过菜单切集自动播放
             out.append(r)
         return out
 
