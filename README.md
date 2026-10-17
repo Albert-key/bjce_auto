@@ -94,8 +94,6 @@ python auto_play.py
 ├── build_portable.py     # 便携版构建脚本(首次构建自动下载嵌入式 Python)
 ├── download_python.py    # 嵌入式 Python 下载器(便携版构建用)
 ├── smoke_test.py         # 浏览器启动冒烟测试
-├── fetch_site.py         # 平台前端代码抓取器(开发分析用, 产物 analysis/)
-├── analyze*.py           # 前端代码分析脚本(开发分析用)
 └── libs/                 # 运行依赖(gitignore, 由 install_libs.py 生成)
 ```
 
