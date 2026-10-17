@@ -199,14 +199,15 @@ def fmt_sec(s):
 
 
 def norm_progress(p):
-    """学时进度统一转为 0-100: 平台不同接口有的返回 0-1 小数, 有的返回 0-100"""
+    """学时进度统一转为 0-100: 平台进度为 0-1 小数(1 即已学完 100%),
+    个别接口可能返回 0-100; 边界 p=1 必须按小数处理为 100%"""
     try:
         p = float(p)
     except (TypeError, ValueError):
         return 0.0
     if p <= 0:
         return 0.0
-    if p < 1:
+    if p <= 1:  # 0-1 小数; 1 = 已学完(100%)。若按 1% 处理会误判已完成为未完成
         return p * 100.0
     return min(p, 100.0)
 
@@ -699,6 +700,8 @@ class Site:
             return False
 
         LOG.write("  ▶ 开始播放")
+        # 课程包: 载入分集表(分集级进度检查用); 普通课程为空表
+        episodes = self._load_episodes(cid)
         stall_start = None
         stall_t = 0
         busy_count = 0
@@ -713,9 +716,25 @@ class Site:
         while not finished:
             st = self.read_state()
 
-            # 每 60 秒检查完成条件: 已学完 或 进度>=80% → 立即切下一课
+            # 每 60 秒检查完成条件
             if time.time() - last_check >= 60:
                 last_check = time.time()
+                # 课程包: 分集级检查(每集开播立即检查+链式快进)
+                if self._episode_check_and_advance(episodes, st):
+                    # 分集切换后立即复查课程级条件(整包可能已完成)
+                    prog, done = self._completion_status(cid)
+                    if done or prog >= PROGRESS_PASS:
+                        why = "平台已标记已学完" if done \
+                            else f"进度已达 {prog:.0f}%"
+                        LOG.write(f"  ✓ 播放中检测到{why}, 切换下一课")
+                        try:
+                            self.page.evaluate(PAUSE_JS)
+                        except Exception:
+                            pass
+                        self.page.wait_for_timeout(8000)
+                        return True
+                    continue
+                # 课程级: 整课已学完 或 进度>=80% → 立即切下一课
                 prog, done = self._completion_status(cid)
                 if done or prog >= PROGRESS_PASS:
                     why = "平台已标记已学完" if done \
@@ -763,6 +782,9 @@ class Site:
                         self.page.wait_for_timeout(6000)
                         self.sniffed.pop("playinfo", None)
                         no_video_since = None
+                        # 新到达的集若已达标, 立即跳下一集
+                        self._episode_check_and_advance(
+                            episodes, self.read_state())
                         continue
                     if time.time() - no_video_since > 180:
                         LOG.write("  ✗ 长时间无视频元素(可能未登录或页面异常), "
@@ -783,6 +805,8 @@ class Site:
                     self.sniffed.pop("playinfo", None)
                     self.try_play()
                     stall_start = None
+                    # 新到达的集若已达标(≥80%/已完成), 立即跳下一集
+                    self._episode_check_and_advance(episodes, self.read_state())
                 else:
                     LOG.write("  ✓ 全部章节播放完毕")
                     finished = True
@@ -863,6 +887,75 @@ class Site:
             done = self.is_marked_done(cid)
         return prog, done
 
+    def _load_episodes(self, cid):
+        """课程包(setType=3): 返回分集 courseId 列表(按菜单顺序); 普通课程返回 []"""
+        try:
+            detail = self.fetch_course_detail(cid)
+            if not (isinstance(detail, dict)
+                    and str(detail.get("setType")) == "3"):
+                return []
+            rel = self.api_get(
+                "api-course/portal/courseInfo/findByCourseLink"
+                f"?courseId={cid}&sourceId=")
+            rel = self.payload(rel)
+            if isinstance(rel, list):
+                eps = [str(e.get("courseId") or e.get("courseID") or "")
+                       for e in rel if isinstance(e, dict)]
+                eps = [e for e in eps if e]
+                if eps:
+                    LOG.write(f"  ℹ 课程包共 {len(eps)} 集, "
+                              "启用分集级检查(单集达标即切下一集)")
+                return eps
+        except Exception:
+            pass
+        return []
+
+    def _episode_progress(self, e_cid):
+        """分集进度(0-100)。分集不出现在"我的课程"列表, 无法查已学完标记,
+        平台对分集的"已学完"即 learningProgress=1(100%), 直接用进度判定。
+        查询失败返回 None"""
+        try:
+            det = self.fetch_course_detail(e_cid)
+            if not isinstance(det, dict):
+                return None
+            return norm_progress(det.get("learningProgress"))
+        except Exception:
+            return None
+
+    def _episode_check_and_advance(self, episodes, st):
+        """分集级检查(含链式快进): 当前分集 达标(≥80% 或已学完100%) → 切换下一集,
+        并立即复查新分集——连续达标连续切换, 直到遇到未达标分集或最后一集。
+        (即: 每一集开始播放时都会被立即检查, 达标不播直接跳下一集)
+        返回 True 表示发生了切换"""
+        switched = False
+        while True:
+            if not episodes:
+                return switched
+            ai = st.get("activeIdx", -1)
+            if ai < 0 or ai >= len(episodes):
+                return switched
+            e_cid = episodes[ai]
+            e_prog = self._episode_progress(e_cid)
+            if e_prog is None:
+                return switched
+            e_done = e_prog >= 99.5  # 100% 即平台标记"已学完"
+            if not (e_done or e_prog >= PROGRESS_PASS):
+                return switched
+            nxt = ai + 1
+            chapters = st.get("chapters") or len(episodes)
+            if nxt >= chapters:
+                return switched  # 最后一集达标: 交给课程级判定处理
+            why = "已学完" if e_done else f"进度已达 {e_prog:.0f}%"
+            LOG.write(f"  ✓ 分集 {ai + 1} {why}, 切换下一集 "
+                      f"({nxt + 1}/{chapters})")
+            self.click_chapter(nxt)
+            self.page.wait_for_timeout(6000)
+            self.sniffed.pop("playinfo", None)
+            self.try_play()
+            switched = True
+            # 重读状态, 立即检查新到达的分集 (链式快进)
+            st = self.read_state()
+
     def _replay_incomplete(self, cid, name):
         info = self.open_course(cid)
         if not info:
@@ -872,6 +965,7 @@ class Site:
         except PWTimeout:
             return False
         # 从第一章开始再走一遍; 每分钟检查完成条件, 满足即提前结束
+        episodes = self._load_episodes(cid)
         LOG.write("  ▶ 重播开始 (每分钟检查: 已学完 或 进度≥"
                   f"{PROGRESS_PASS:g}%, 满足即切下一课)")
         deadline = time.time() + 3 * 3600
@@ -882,6 +976,22 @@ class Site:
             # 每 60 秒检查一次完成条件
             if time.time() - last_check >= 60:
                 last_check = time.time()
+                # 课程包: 分集级检查(每集开播立即检查+链式快进)
+                if self._episode_check_and_advance(
+                        episodes, self.read_state()):
+                    # 分集切换后立即复查课程级条件
+                    prog, done = self._completion_status(cid)
+                    if done or prog >= PROGRESS_PASS:
+                        why = "平台已标记已学完" if done \
+                            else f"进度已达 {prog:.0f}%"
+                        LOG.write(f"  ✓ 补播中检测到{why}, 提前结束, 播放下一课")
+                        try:
+                            self.page.evaluate(PAUSE_JS)
+                        except Exception:
+                            pass
+                        self.page.wait_for_timeout(8000)
+                        return True
+                    continue
                 prog, done = self._completion_status(cid)
                 if done or prog >= PROGRESS_PASS:
                     why = "平台已标记已学完" if done \
@@ -916,6 +1026,9 @@ class Site:
                         self.page.wait_for_timeout(6000)
                         self.sniffed.pop("playinfo", None)
                         no_video_since = None
+                        # 新到达的集若已达标, 立即跳下一集
+                        self._episode_check_and_advance(
+                            episodes, self.read_state())
                 self.page.wait_for_timeout(SCAN_INTERVAL * 1000)
                 continue
             no_video_since = None
@@ -925,6 +1038,9 @@ class Site:
                     self.click_chapter(nxt)
                     self.page.wait_for_timeout(6000)
                     self.try_play()
+                    # 新到达的集若已达标, 立即跳下一集
+                    self._episode_check_and_advance(
+                        episodes, self.read_state())
                 else:
                     break
             elif st.get("paused"):
